@@ -1,0 +1,46 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Logs ===
+*.log
+logs/
+
+# === 🛡️ СЕКРЕТЫ (НИКОГДА НЕ КОММИТИТЬ!) ===
+.env
+*.env
+env.local
+credentials.json
+*.key
+*.pem
+secrets.py
+
+# === Database ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === Бэкапы БД ===
+backups/
+*.sql
+*.dump
+
+# === Временные/диагностические файлы ===
+code.txt
+check_*.py
