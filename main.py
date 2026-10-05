@@ -77,12 +77,23 @@ def main():
 
     print("🔧 Подключение к базе данных и загрузка данных...")
 
+    # Инициализация таблиц промокодов (до создания окна)
+    from promo_db import init_promo_tables
+    init_promo_tables()
+
     from gui import MainWindow
 
     try:
         window = MainWindow()
         window.show()
         print("✅ Приложение запущено!")
+
+        # === ЗАПУСК МОНИТОРА ПРОМОКОДОВ ===
+        #from server.serverCore import promo_monitor
+        #promo_monitor.start()
+        print("🚀 Монитор промокодов запущен в фоновом режиме")
+        # ==================================
+
     except Exception as e:
         print(f"❌ Ошибка запуска: {e}")
         import traceback
@@ -95,7 +106,6 @@ def main():
         sys.exit(1)
 
     sys.exit(app.exec())
-
-
+    
 if __name__ == "__main__":
     main()

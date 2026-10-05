@@ -10,10 +10,27 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 
+# === MySQL Database ===
+DB_HOST = os.getenv("DB_HOST", "vh454.timeweb.ru")
+DB_USER = os.getenv("DB_USER", "cj25907_cybermg")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "cj25907_cybermg")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
+
 # === SmartShell ===
+# === SmartShell Account 1 (Основной, для интерфейса и создания товаров/промокодов) ===
 SMARTSHELL_GRAPHQL_URL = os.getenv("SMARTSHELL_GRAPHQL_URL", "https://billing.smartshell.gg/api/graphql")
+SMARTSHELL_V2_GRAPHQL_URL = "https://billing.smartshell.gg/api/v2/graphql"  # V2 URL одинаковый для всех
 SMARTSHELL_LOGIN = os.getenv("SMARTSHELL_LOGIN", "")
 SMARTSHELL_PASSWORD = os.getenv("SMARTSHELL_PASSWORD", "")
+
+# === SmartShell Account 2 (Для фонового мониторинга событий и синхронизации) ===
+# Использует тот же старый эндпоинт для EventList и тот же V2 для PromoCodesListV2 / UpdatePromoCodeV2
+SMARTSHELL2_GRAPHQL_URL = os.getenv("SMARTSHELL2_GRAPHQL_URL", "https://billing.smartshell.gg/api/graphql")
+SMARTSHELL2_V2_GRAPHQL_URL = "https://billing.smartshell.gg/api/v2/graphql"
+SMARTSHELL2_LOGIN = os.getenv("SMARTSHELL2_LOGIN", "")
+SMARTSHELL2_PASSWORD = os.getenv("SMARTSHELL2_PASSWORD", "")
 SMARTSHELL_WAREHOUSE_IDS = {
     "Русская": 1598,
     "Сахалинская": 3241,
@@ -43,6 +60,12 @@ DB_CONFIG = {
 GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "credentials.json")
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "")
 GOOGLE_SHEETS_WORKSHEET = os.getenv("GOOGLE_SHEETS_WORKSHEET", "Штрафы")
+
+# === Promo Sheets (промокоды) ===
+# Если промокоды в той же таблице - оставь GOOGLE_PROMO_SHEETS_ID пустым (будет использован GOOGLE_SHEETS_ID)
+# Если в отдельной таблице - укажи её ID
+GOOGLE_PROMO_SHEETS_ID = os.getenv("GOOGLE_PROMO_SHEETS_ID", "")
+GOOGLE_PROMO_SHEETS_WORKSHEET = os.getenv("GOOGLE_PROMO_SHEETS_WORKSHEET", "Промокоды")
 
 # === ТОЧКИ СКЛАДА ===
 WAREHOUSES = [

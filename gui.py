@@ -2,25 +2,34 @@
 GUI Module - Графический интерфейс приложения (PySide6)
 """
 import os
+from typing import List, Dict
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QPushButton, QLineEdit, QComboBox, QLabel, QGroupBox,
     QMessageBox, QFileDialog, QStatusBar, QMenuBar, QMenu,
-    QFrame, QSplitter, QSpinBox, QDialog, QCheckBox, QDialogButtonBox
+    QFrame, QSplitter, QSpinBox, QDoubleSpinBox, QDialog, QCheckBox, QDialogButtonBox,
+    QProgressBar, QTextEdit, QPlainTextEdit, QInputDialog, QFormLayout
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap, QPainter, QBrush, QAction, QColor
+
+import csv
+import pandas as pd
 from PIL import Image
 from PIL.ImageQt import ImageQt
-import pandas as pd
 
+from promo_sheets_client import PromoSheetsClient
 from config import DARK_THEME, WINDOW_TITLE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, WAREHOUSES
 from data import DatabaseManager
 from image import BackgroundManager
-from smartshell_api import create_good_multiple_warehouses
 from refstate_repository import RefStateRepository
 from refstate_dialog import RefStateProcessDialog
+from smartshell_api import (
+    create_good_multiple_warehouses,
+    create_promocode_multiple_warehouses_v2
+)
 
 
 class AddProductDialog(QDialog):
@@ -103,6 +112,513 @@ class AddProductDialog(QDialog):
             "points": selected_points
         }
 
+
+class AddPromoCodeDialog(QDialog):
+    """Диалоговое окно создания промокодов в SmartShell (v2) с поддержкой Google Sheets"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Создание промокодов (v2)")
+        self.setMinimumWidth(900)
+        self.setMinimumHeight(700)
+        self.checkboxes = {}
+        self.promo_list = []
+        self.sheets_client = PromoSheetsClient()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<h3>🎟️ Массовое создание промокодов</h3>"))
+
+        # === ПАНЕЛЬ РУЧНОГО ВВОДА ===
+        manual_group = QGroupBox("➕ Добавить один промокод вручную")
+        manual_layout = QVBoxLayout(manual_group)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Код *:"))
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("VIP2026")
+        row1.addWidget(self.code_input)
+        manual_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Тип *:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["BONUS", "DISCOUNT", "DEPOSIT"])
+        row2.addWidget(self.type_combo)
+
+        row2.addWidget(QLabel("Значение *:"))
+        self.value_input = QSpinBox()
+        self.value_input.setMinimum(0)
+        self.value_input.setMaximum(9999999)
+        self.value_input.setValue(1000)
+        row2.addWidget(self.value_input)
+
+        row2.addWidget(QLabel("Активаций:"))
+        self.amount_input = QSpinBox()
+        self.amount_input.setMinimum(1)
+        self.amount_input.setMaximum(99999)
+        self.amount_input.setValue(1)
+        row2.addWidget(self.amount_input)
+        manual_layout.addLayout(row2)
+
+        add_single_btn = QPushButton("➕ Добавить в список")
+        add_single_btn.setStyleSheet("QPushButton { background-color: #a6e3a1; color: #1e1e2e; font-weight: bold; }")
+        add_single_btn.clicked.connect(self.add_single_to_list)
+        manual_layout.addWidget(add_single_btn)
+
+        layout.addWidget(manual_group)
+
+        # === ПАНЕЛЬ ИМПОРТА ===
+        import_layout = QHBoxLayout()
+
+        import_sheets_btn = QPushButton("📊 Загрузить из Google Таблицы")
+        import_sheets_btn.setStyleSheet("QPushButton { background-color: #89b4fa; color: #1e1e2e; font-weight: bold; padding: 8px; }")
+        import_sheets_btn.clicked.connect(self.import_from_google_sheets)
+        import_layout.addWidget(import_sheets_btn)
+
+        import_csv_btn = QPushButton("📥 Загрузить из CSV")
+        import_csv_btn.setStyleSheet("QPushButton { background-color: #94e2d5; color: #1e1e2e; font-weight: bold; padding: 8px; }")
+        import_csv_btn.clicked.connect(self.import_from_csv)
+        import_layout.addWidget(import_csv_btn)
+
+        clear_list_btn = QPushButton("🗑️ Очистить список")
+        clear_list_btn.setStyleSheet("QPushButton { background-color: #f38ba8; color: #1e1e2e; font-weight: bold; padding: 8px; }")
+        clear_list_btn.clicked.connect(self.clear_list)
+        import_layout.addWidget(clear_list_btn)
+
+        layout.addLayout(import_layout)
+
+        # === ТАБЛИЦА ПРОМОКОДОВ ===
+        self.promo_table = QTableWidget()
+        self.promo_table.setColumnCount(5)
+        self.promo_table.setHorizontalHeaderLabels(["Код", "Тип", "Значение", "Активаций", "Статус"])
+        self.promo_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.promo_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.promo_table)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        # === ВЫБОР ТОЧЕК ===
+        points_group = QGroupBox("Точки SmartShell (применить ко всем промокодам)")
+        points_layout = QVBoxLayout(points_group)
+        for point in WAREHOUSES:
+            cb = QCheckBox(point)
+            cb.setChecked(True)
+            self.checkboxes[point] = cb
+            points_layout.addWidget(cb)
+        layout.addWidget(points_group)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText("🚀 Создать все промокоды")
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def add_single_to_list(self):
+        code = self.code_input.text().strip()
+        if not code:
+            QMessageBox.warning(self, "Ошибка", "Введите код промокода")
+            return
+
+        promo = {
+            "code": code,
+            "value_type": self.type_combo.currentText(),
+            "value_amount": float(self.value_input.value()),
+            "amount": self.amount_input.value()
+        }
+        self.promo_list.append(promo)
+        self._refresh_table()
+        self.code_input.clear()
+
+    def import_from_google_sheets(self):
+        QApplication.processEvents()
+        result = self.sheets_client.read_promocodes_from_sheet()
+
+        if result["success"]:
+            self.promo_list.extend(result["promocodes"])
+            self._refresh_table()
+
+            msg = f"✅ Загружено: {result['total']} промокодов из листа '{self.sheets_client.worksheet_name}'"
+            if result["errors"]:
+                msg += f"\n\n⚠️ Ошибок: {len(result['errors'])}\n" + "\n".join(result["errors"][:10])
+            QMessageBox.information(self, "Импорт из Google Sheets", msg)
+        else:
+            error_msg = "\n".join(result["errors"])
+            QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить данные:\n{error_msg}")
+
+    def import_from_csv(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите CSV файл", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            imported_count = 0
+            errors = []
+
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+
+                required_cols = {'code', 'type', 'value'}
+                if not required_cols.issubset(set(col.lower() for col in reader.fieldnames or [])):
+                    QMessageBox.warning(
+                        self, "Ошибка формата",
+                        f"В CSV должны быть колонки: code, type, value\n"
+                        f"Найдены: {reader.fieldnames}"
+                    )
+                    return
+
+                for row_num, row in enumerate(reader, start=2):
+                    try:
+                        code = row.get('code', '').strip()
+                        type_val = row.get('type', 'BONUS').strip().upper()
+                        value = float(row.get('value', '0').replace(',', '.'))
+                        amount = int(row.get('amount', '1').replace(',', '.'))
+
+                        if not code:
+                            errors.append(f"Строка {row_num}: пустой код")
+                            continue
+                        if type_val not in ['BONUS', 'DISCOUNT', 'DEPOSIT']:
+                            errors.append(f"Строка {row_num}: неверный тип '{type_val}'")
+                            continue
+
+                        self.promo_list.append({
+                            "code": code,
+                            "value_type": type_val,
+                            "value_amount": value,
+                            "amount": amount
+                        })
+                        imported_count += 1
+                    except Exception as e:
+                        errors.append(f"Строка {row_num}: {str(e)}")
+
+            self._refresh_table()
+
+            msg = f"✅ Импортировано: {imported_count} промокодов"
+            if errors:
+                msg += f"\n\n⚠️ Ошибок: {len(errors)}\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... и ещё {len(errors) - 5}"
+            QMessageBox.information(self, "Импорт CSV", msg)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось прочитать файл:\n{str(e)}")
+
+    def clear_list(self):
+        if self.promo_list and QMessageBox.question(
+            self, "Подтверждение", "Очистить весь список промокодов?",
+            QMessageBox.Yes | QMessageBox.No
+        ) == QMessageBox.Yes:
+            self.promo_list.clear()
+            self._refresh_table()
+
+    def _refresh_table(self):
+        self.promo_table.setRowCount(len(self.promo_list))
+        for i, promo in enumerate(self.promo_list):
+            self.promo_table.setItem(i, 0, QTableWidgetItem(promo["code"]))
+            self.promo_table.setItem(i, 1, QTableWidgetItem(promo["value_type"]))
+            self.promo_table.setItem(i, 2, QTableWidgetItem(str(promo["value_amount"])))
+            self.promo_table.setItem(i, 3, QTableWidgetItem(str(promo["amount"])))
+            self.promo_table.setItem(i, 4, QTableWidgetItem("⏳ Ожидает"))
+
+    def get_promo_list(self) -> list:
+        selected_points = [name for name, cb in self.checkboxes.items() if cb.isChecked()]
+        return self.promo_list, selected_points
+
+
+class CSVProcessorDialog(QDialog):
+    """Диалог обработки промокодов из Google Sheets"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Обработка промокодов из Google Sheets")
+        self.setMinimumSize(700, 500)
+
+        self.sheets_client = None
+        self.promocodes = []
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("<h3>📊 Обработка промокодов из Google Sheets</h3>"))
+
+        self.info_label = QLabel("Нажмите 'Загрузить данные' для подключения к таблице")
+        layout.addWidget(self.info_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Строка", "Код", "Тип", "Значение", "Активаций", "Статус"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+
+        self.load_btn = QPushButton("🔄 Загрузить данные")
+        self.load_btn.clicked.connect(self.load_data)
+        btn_layout.addWidget(self.load_btn)
+
+        self.process_btn = QPushButton("▶️ Обработать необработанные")
+        self.process_btn.clicked.connect(self.process_unprocessed)
+        self.process_btn.setEnabled(False)
+        btn_layout.addWidget(self.process_btn)
+
+        self.process_all_btn = QPushButton("⚡ Обработать ВСЕ")
+        self.process_all_btn.clicked.connect(self.process_all)
+        self.process_all_btn.setEnabled(False)
+        btn_layout.addWidget(self.process_all_btn)
+
+        btn_layout.addStretch()
+
+        self.close_btn = QPushButton("Закрыть")
+        self.close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(150)
+        layout.addWidget(self.log_text)
+
+    def log(self, message: str):
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        QApplication.processEvents()
+
+    def load_data(self):
+        self.log("Подключение к Google Sheets...")
+
+        try:
+            self.sheets_client = PromoSheetsClient()
+            success, message, self.promocodes = self.sheets_client.get_all_promocodes()
+
+            if not success:
+                self.log(f"❌ {message}")
+                QMessageBox.critical(self, "Ошибка", message)
+                return
+
+            self.log(f"✅ Загружено {len(self.promocodes)} промокодов")
+
+            self.table.setRowCount(len(self.promocodes))
+
+            for idx, promo in enumerate(self.promocodes):
+                self.table.setItem(idx, 0, QTableWidgetItem(str(promo["row"])))
+                self.table.setItem(idx, 1, QTableWidgetItem(promo["code"]))
+                self.table.setItem(idx, 2, QTableWidgetItem(promo["type"]))
+                self.table.setItem(idx, 3, QTableWidgetItem(str(promo["value"])))
+                self.table.setItem(idx, 4, QTableWidgetItem(str(promo["amount"])))
+
+                status = "✅ Обработан" if promo["is_processed"] else "⏳ Ожидает"
+                status_item = QTableWidgetItem(status)
+
+                if promo["is_processed"]:
+                    for col in range(6):
+                        self.table.item(idx, col).setBackground(QColor(166, 227, 161))
+
+                self.table.setItem(idx, 5, status_item)
+
+            unprocessed_count = sum(1 for p in self.promocodes if not p["is_processed"])
+            self.info_label.setText(f"Всего: {len(self.promocodes)} | Необработанных: {unprocessed_count}")
+
+            self.process_btn.setEnabled(unprocessed_count > 0)
+            self.process_all_btn.setEnabled(len(self.promocodes) > 0)
+
+        except Exception as e:
+            self.log(f"❌ Ошибка: {str(e)}")
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def process_unprocessed(self):
+        unprocessed = [p for p in self.promocodes if not p["is_processed"]]
+        self._process_promocodes(unprocessed)
+
+    def process_all(self):
+        reply = QMessageBox.question(
+            self, "Подтверждение",
+            f"Обработать ВСЕ {len(self.promocodes)} промокодов?\n"
+            "(Уже обработанные будут созданы повторно)",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self._process_promocodes(self.promocodes)
+
+    def _process_promocodes(self, promocodes: List[Dict]):
+        if not promocodes:
+            self.log("Нет промокодов для обработки")
+            return
+
+        parent_dialog = self.parent()
+        selected_points = [name for name, cb in parent_dialog.checkboxes.items() if cb.isChecked()]
+
+        if not selected_points:
+            QMessageBox.warning(self, "Ошибка", "Выберите хотя бы одну точку в основном диалоге")
+            return
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(promocodes))
+        self.progress_bar.setValue(0)
+
+        success_count = 0
+        error_count = 0
+
+        for idx, promo in enumerate(promocodes):
+            self.log(f"Обработка: {promo['code']}...")
+
+            result = create_promocode_multiple_warehouses_v2(
+                warehouse_names=selected_points,
+                code=promo["code"],
+                value_type=promo["type"],
+                value_amount=promo["value"],
+                amount=promo["amount"]
+            )
+
+            if result["success"]:
+                success_count += len(result["success"])
+                self.log(f"✅ {promo['code']}: создано на {len(result['success'])} точках")
+
+                if self.sheets_client:
+                    mark_success, mark_msg = self.sheets_client.mark_as_processed(promo["row"])
+                    if mark_success:
+                        for col in range(6):
+                            self.table.item(idx, col).setBackground(QColor(166, 227, 161))
+                        self.table.item(idx, 5).setText("✅ Обработан")
+                    else:
+                        self.log(f"⚠️ Не удалось отметить в таблице: {mark_msg}")
+            else:
+                error_count += len(result["errors"])
+                self.log(f"❌ {promo['code']}: ошибки на {len(result['errors'])} точках")
+                for wh, err in result["errors"]:
+                    self.log(f"   • {wh}: {err}")
+
+            self.progress_bar.setValue(idx + 1)
+            QApplication.processEvents()
+
+        self.progress_bar.setVisible(False)
+        self.log(f"\n{'='*60}")
+        self.log(f"Итого: ✅ {success_count} успешно | ❌ {error_count} ошибок")
+        self.log(f"{'='*60}\n")
+
+        QMessageBox.information(
+            self, "Результат",
+            f"Обработка завершена!\n\n"
+            f"✅ Успешно: {success_count}\n"
+            f"❌ Ошибок: {error_count}"
+        )
+
+
+class PromoCodeListDialog(QDialog):
+    """Диалог просмотра и управления списком промокодов из Google Sheets"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Список промокодов")
+        self.setMinimumSize(800, 600)
+
+        self.sheets_client = None
+        self.promocodes = []
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("<h3>📋 Управление промокодами</h3>"))
+
+        self.info_label = QLabel("Нажмите 'Обновить' для загрузки данных")
+        layout.addWidget(self.info_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["Строка", "Код", "Тип", "Значение", "Активаций", "Статус", "Действия"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+
+        self.refresh_btn = QPushButton("🔄 Обновить")
+        self.refresh_btn.clicked.connect(self.load_data)
+        btn_layout.addWidget(self.refresh_btn)
+
+        btn_layout.addStretch()
+
+        self.close_btn = QPushButton("Закрыть")
+        self.close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+    def load_data(self):
+        try:
+            self.sheets_client = PromoSheetsClient()
+            success, message, self.promocodes = self.sheets_client.get_all_promocodes()
+
+            if not success:
+                QMessageBox.critical(self, "Ошибка", message)
+                return
+
+            self.table.setRowCount(len(self.promocodes))
+
+            for idx, promo in enumerate(self.promocodes):
+                self.table.setItem(idx, 0, QTableWidgetItem(str(promo["row"])))
+                self.table.setItem(idx, 1, QTableWidgetItem(promo["code"]))
+                self.table.setItem(idx, 2, QTableWidgetItem(promo["type"]))
+                self.table.setItem(idx, 3, QTableWidgetItem(str(promo["value"])))
+                self.table.setItem(idx, 4, QTableWidgetItem(str(promo["amount"])))
+
+                status = "✅ Обработан" if promo["is_processed"] else "⏳ Ожидает"
+                status_item = QTableWidgetItem(status)
+
+                if promo["is_processed"]:
+                    for col in range(6):
+                        self.table.item(idx, col).setBackground(QColor(166, 227, 161))
+
+                self.table.setItem(idx, 5, status_item)
+
+                delete_btn = QPushButton("🗑️ Удалить")
+                delete_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #f38ba8;
+                        color: #1e1e2e;
+                        font-weight: bold;
+                    }
+                    QPushButton:hover {
+                        background-color: #eba0ac;
+                    }
+                """)
+                delete_btn.clicked.connect(lambda checked, row=promo["row"], idx=idx: self.delete_row(row, idx))
+                self.table.setCellWidget(idx, 6, delete_btn)
+
+            processed_count = sum(1 for p in self.promocodes if p["is_processed"])
+            unprocessed_count = len(self.promocodes) - processed_count
+            self.info_label.setText(f"Всего: {len(self.promocodes)} | ✅ Обработанных: {processed_count} | ⏳ Ожидает: {unprocessed_count}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def delete_row(self, row: int, table_idx: int):
+        reply = QMessageBox.question(
+            self, "Подтверждение удаления",
+            f"Удалить промокод из строки {row}?\n"
+            "Данные ниже сдвинутся вверх.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                success, message = self.sheets_client.delete_row(row)
+                if success:
+                    QMessageBox.information(self, "Успех", f"Строка {row} удалена")
+                    self.load_data()
+                else:
+                    QMessageBox.critical(self, "Ошибка", message)
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", str(e))
 
 class AddToSmartShellDialog(QDialog):
     """Диалоговое окно добавления товара в SmartShell"""
@@ -307,7 +823,6 @@ class AddToSmartShellDialog(QDialog):
             "low_stock_threshold": self.low_stock_threshold.value()
         }
 
-
 class MainWindow(QMainWindow):
     """Главное окно приложения"""
 
@@ -317,10 +832,9 @@ class MainWindow(QMainWindow):
         self.db_manager = DatabaseManager()
         self.bg_manager = BackgroundManager()
 
-        self.gif_timer = QTimer()
+        self.gif_timer = QTimer(self)
         self.gif_timer.timeout.connect(self.update_gif_frame)
 
-        # Кэш для оптимизации отрисовки фона
         self._cached_pixmap = None
         self._cached_size = None
 
@@ -330,8 +844,6 @@ class MainWindow(QMainWindow):
         self.load_initial_data()
 
     def init_ui(self):
-        from refstate_repository import RefStateRepository
-        from refstate_dialog import RefStateProcessDialog
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.resize(1400, 900)
@@ -358,7 +870,7 @@ class MainWindow(QMainWindow):
         self.create_penalties_tab()
         self.create_invoices_tab()
         self.create_missing_items_tab()
-        self.create_refstate_tab()  # 🆕 Новая вкладка
+        self.create_refstate_tab()
         main_layout.addWidget(self.tabs)
 
         self.status_bar = QStatusBar()
@@ -494,7 +1006,6 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self.load_products)
         actions_layout.addWidget(refresh_btn)
 
-        # Кнопка добавления в БД
         add_btn = QPushButton("➕ Добавить товар")
         add_btn.clicked.connect(self.open_add_product_dialog)
         add_btn.setStyleSheet("""
@@ -510,7 +1021,6 @@ class MainWindow(QMainWindow):
         """)
         actions_layout.addWidget(add_btn)
 
-        # Кнопка добавления в SmartShell
         add_shell_btn = QPushButton("☁️ Добавить в SmartShell")
         add_shell_btn.clicked.connect(self.open_add_to_smartshell_dialog)
         add_shell_btn.setStyleSheet("""
@@ -525,6 +1035,21 @@ class MainWindow(QMainWindow):
             }
         """)
         actions_layout.addWidget(add_shell_btn)
+
+        add_promo_btn = QPushButton("🎟️ Создать промокод")
+        add_promo_btn.clicked.connect(self.open_add_promocode_dialog)
+        add_promo_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f9e2af;
+                color: #1e1e2e;
+                font-weight: bold;
+                border: 1px solid #fab387;
+            }
+            QPushButton:hover {
+                background-color: #f5c277;
+            }
+        """)
+        actions_layout.addWidget(add_promo_btn)
 
         actions_layout.addStretch()
 
@@ -599,51 +1124,47 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "⚠️ Штрафы")
 
     def create_invoices_tab(self):
-        """Вкладка переданных фактур (таблица processed_invoices)"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
-        # Заголовок
+
         header = QLabel("<h3>📄 Переданные фактуры</h3>")
         layout.addWidget(header)
-        
+
         hint = QLabel(
             "Список фактур, которые были обработаны и переданы в систему.\n"
             "Данные берутся из таблицы <b>processed_invoices</b>."
         )
         hint.setStyleSheet("color: #a6adc8;")
         layout.addWidget(hint)
-        
-        # Панель фильтров
+
         filter_layout = QHBoxLayout()
-        
+
         filter_layout.addWidget(QLabel("Дата с:"))
         self.invoice_date_from = QLineEdit()
         self.invoice_date_from.setPlaceholderText("ГГГГ-ММ-ДД")
         self.invoice_date_from.setMaximumWidth(120)
         filter_layout.addWidget(self.invoice_date_from)
-        
+
         filter_layout.addWidget(QLabel("по:"))
         self.invoice_date_to = QLineEdit()
         self.invoice_date_to.setPlaceholderText("ГГГГ-ММ-ДД")
         self.invoice_date_to.setMaximumWidth(120)
         filter_layout.addWidget(self.invoice_date_to)
-        
+
         filter_layout.addWidget(QLabel("Поиск по номеру:"))
         self.invoice_search = QLineEdit()
         self.invoice_search.setPlaceholderText("Номер фактуры...")
         self.invoice_search.setMaximumWidth(200)
         filter_layout.addWidget(self.invoice_search)
-        
+
         apply_btn = QPushButton("🔍 Применить")
         apply_btn.clicked.connect(self.load_invoices)
         filter_layout.addWidget(apply_btn)
-        
+
         reset_btn = QPushButton("🔄 Сбросить")
         reset_btn.clicked.connect(self.reset_invoices_filters)
         filter_layout.addWidget(reset_btn)
-        
-        # 🆕 Кнопка полной перезагрузки
+
         reload_btn = QPushButton("⚡ Перечитать из БД")
         reload_btn.setStyleSheet("""
             QPushButton {
@@ -655,16 +1176,14 @@ class MainWindow(QMainWindow):
         """)
         reload_btn.clicked.connect(self.reload_invoices_from_db)
         filter_layout.addWidget(reload_btn)
-        
+
         filter_layout.addStretch()
-        
-        # Статистика
+
         self.invoices_stats_label = QLabel("Всего: 0")
         filter_layout.addWidget(self.invoices_stats_label)
-        
+
         layout.addLayout(filter_layout)
-        
-        # Таблица
+
         self.invoices_table = QTableWidget()
         self.invoices_table.setAlternatingRowColors(True)
         self.invoices_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -672,35 +1191,25 @@ class MainWindow(QMainWindow):
         self.invoices_table.verticalHeader().setVisible(False)
         self.invoices_table.setSortingEnabled(True)
         layout.addWidget(self.invoices_table)
-        
+
         self.tabs.addTab(tab, "📄 Переданные фактуры")
 
     def reset_invoices_filters(self):
-        """Сброс фильтров для вкладки фактур"""
         self.invoice_date_from.clear()
         self.invoice_date_to.clear()
         self.invoice_search.clear()
         self.load_invoices()
 
     def reload_invoices_from_db(self):
-        """Полная перезагрузка данных из БД"""
         self.invoice_date_from.clear()
         self.invoice_date_to.clear()
         self.invoice_search.clear()
-        
-        # Переподключаемся к БД если нужно
+
         if not self.db_manager.connection or not self.db_manager.connection.open:
             self.db_manager.reconnect()
-        
+
         self.load_invoices()
         self.status_bar.showMessage("✅ Фактуры перечитаны из БД")
-
-    def reset_invoices_filters(self):
-        """Сброс фильтров для вкладки фактур"""
-        self.invoice_date_from.clear()
-        self.invoice_date_to.clear()
-        self.invoice_search.clear()
-        self.load_invoices()
 
     def create_missing_items_tab(self):
         tab = QWidget()
@@ -744,7 +1253,7 @@ class MainWindow(QMainWindow):
             self.load_invoices()
         elif index == 5:
             self.load_missing_items()
-        elif index == 6:  # 🆕 Новая вкладка
+        elif index == 6:
             self.load_refstate_admins()
 
     def load_products(self):
@@ -787,52 +1296,21 @@ class MainWindow(QMainWindow):
         self.display_table(self.penalties_table, df)
 
     def load_invoices(self):
-        """Загружает данные из таблицы processed_invoices"""
         date_from = self.invoice_date_from.text().strip() or None
         date_to = self.invoice_date_to.text().strip() or None
         search_text = self.invoice_search.text().strip() or None
-        
-        print(f"[GUI Invoices] Загрузка: date_from={date_from}, date_to={date_to}, search='{search_text}'")
-        
+
         df = self.db_manager.get_processed_invoices(
             date_from=date_from,
             date_to=date_to,
             search_text=search_text
         )
-        
-        # Обновляем статистику
+
         total = len(df)
         self.invoices_stats_label.setText(f"Всего: {total}")
-        
-        # Отображаем таблицу
+
         self.display_table(self.invoices_table, df)
 
-
-    def display_invoices_table(self, df: pd.DataFrame):
-        """Отображает таблицу фактур с принудительной очисткой"""
-        self.invoices_table.setSortingEnabled(False)
-        
-        # 🆕 Принудительно очищаем таблицу перед заполнением
-        self.invoices_table.clear()
-        self.invoices_table.setRowCount(0)
-        
-        if df.empty:
-            self.invoices_table.setColumnCount(3)
-            self.invoices_table.setHorizontalHeaderLabels(["id", "invoice_number", "processed_at"])
-            self.invoices_table.setSortingEnabled(True)
-            return
-        
-        self.invoices_table.setRowCount(len(df))
-        self.invoices_table.setColumnCount(len(df.columns))
-        self.invoices_table.setHorizontalHeaderLabels(list(df.columns))
-        
-        for row_idx, row in df.iterrows():
-            for col_idx, (col_name, value) in enumerate(row.items()):
-                item = QTableWidgetItem(str(value))
-                self.invoices_table.setItem(row_idx, col_idx, item)
-        
-        self.invoices_table.resizeColumnsToContents()
-        self.invoices_table.setSortingEnabled(True)
     def load_missing_items(self):
         df = self.db_manager.get_missing_smartshell_items()
         self.display_table(self.missing_items_table, df)
@@ -880,33 +1358,27 @@ class MainWindow(QMainWindow):
         self.products_table.setSortingEnabled(True)
 
     def display_table(self, table: QTableWidget, df: pd.DataFrame):
-        """Универсальный метод отображения таблицы из DataFrame"""
         table.setSortingEnabled(False)
-        
-        # 🆕 Принудительная очистка
+
         table.clear()
         table.setRowCount(0)
-        
+
         if df.empty:
             table.setSortingEnabled(True)
             return
-        
-        # 🆕 Переиндексируем DataFrame для корректных row_idx
+
         df = df.reset_index(drop=True)
-        
+
         table.setRowCount(len(df))
         table.setColumnCount(len(df.columns))
         table.setHorizontalHeaderLabels(df.columns)
-        
-        # 🆕 Используем enumerate для гарантированно последовательных индексов
+
         for row_idx, (_, row) in enumerate(df.iterrows()):
             for col_idx, value in enumerate(row):
                 item = QTableWidgetItem(str(value))
                 table.setItem(row_idx, col_idx, item)
-        
-        table.setSortingEnabled(True)
 
-    
+        table.setSortingEnabled(True)
 
     def apply_filters(self):
         current_tab = self.tabs.currentIndex()
@@ -1078,7 +1550,6 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             data = dialog.get_data()
 
-            # Валидация обязательных полей
             if not data["title"]:
                 QMessageBox.warning(self, "Ошибка", "Введите название товара (title)")
                 return
@@ -1087,7 +1558,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", "Выберите хотя бы одну точку")
                 return
 
-            # Подтверждение
             points_list = "\n".join([f"• {p}" for p in data["points"]])
             confirm_msg = (
                 f"Создать товар <b>{data['title']}</b> в SmartShell?\n\n"
@@ -1109,10 +1579,8 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
 
-            # Создание товара
             self.status_bar.showMessage("Создание товара в SmartShell...")
 
-            # Формируем kwargs для опциональных параметров
             kwargs = {}
             if data["subtitle"]:
                 kwargs["subtitle"] = data["subtitle"]
@@ -1143,7 +1611,6 @@ class MainWindow(QMainWindow):
                 **kwargs
             )
 
-            # Формируем отчёт
             report = []
             if result["success"]:
                 report.append(f"✅ Создано на {len(result['success'])} точках:\n" +
@@ -1156,6 +1623,103 @@ class MainWindow(QMainWindow):
 
             success_count = len(result["success"])
             self.status_bar.showMessage(f"Создано в SmartShell: {success_count} товаров")
+
+    def open_add_promocode_dialog(self):
+        """Открывает диалог массового создания промокодов с поддержкой Google Sheets"""
+        dialog = AddPromoCodeDialog(self)
+
+        if dialog.exec() == QDialog.Accepted:
+            promo_list, selected_points = dialog.get_promo_list()
+
+            if not promo_list:
+                QMessageBox.warning(self, "Ошибка", "Список промокодов пуст. Добавьте вручную или загрузите из Google Sheets.")
+                return
+
+            if not selected_points:
+                QMessageBox.warning(self, "Ошибка", "Выберите хотя бы одну точку")
+                return
+
+            points_list = "\n".join([f"• {p}" for p in selected_points])
+            confirm_msg = (
+                f"Создать <b>{len(promo_list)}</b> промокодов в SmartShell?\n\n"
+                f"🏪 Точки ({len(selected_points)}): \n{points_list}\n\n"
+                f"Промокоды будут действовать в BILLING, MOBILE_APP, SHELL.\n"
+                f"После создания ячейки в Google Sheets будут помечены зелёным."
+            )
+
+            reply = QMessageBox.question(
+                self, "Подтверждение", confirm_msg,
+                QMessageBox.Yes | QMessageBox.No
+            )
+
+            if reply != QMessageBox.Yes:
+                return
+
+            self.status_bar.showMessage(f"Создание {len(promo_list)} промокодов...")
+            QApplication.processEvents()
+
+            progress_dialog = QDialog(self)
+            progress_dialog.setWindowTitle("Создание промокодов")
+            progress_dialog.setMinimumWidth(600)
+            progress_dialog.setMinimumHeight(400)
+            progress_layout = QVBoxLayout(progress_dialog)
+
+            progress_label = QLabel(f"Создано 0 из {len(promo_list)}")
+            progress_layout.addWidget(progress_label)
+
+            progress_bar = QProgressBar()
+            progress_bar.setMaximum(len(promo_list))
+            progress_bar.setValue(0)
+            progress_layout.addWidget(progress_bar)
+
+            log_text = QPlainTextEdit()
+            log_text.setReadOnly(True)
+            progress_layout.addWidget(log_text)
+
+            progress_dialog.show()
+
+            total_success = 0
+            total_errors = 0
+
+            sheets_client = PromoSheetsClient()
+            worksheet_name = getattr(dialog, 'current_worksheet_name', None)
+
+            for i, promo in enumerate(promo_list):
+                progress_label.setText(f"Создание {i+1} из {len(promo_list)}: {promo['code']}...")
+                progress_bar.setValue(i)
+                QApplication.processEvents()
+
+                result = create_promocode_multiple_warehouses_v2(
+                    warehouse_names=selected_points,
+                    code=promo["code"],
+                    value_type=promo["value_type"],
+                    value_amount=promo["value_amount"],
+                    amount=promo["amount"]
+                )
+
+                if result["success"]:
+                    total_success += len(result["success"])
+                    log_text.appendPlainText(f"✅ {promo['code']}: создано на {len(result['success'])} точках")
+
+                    if "row" in promo:
+                        if sheets_client.mark_cell_green(promo["row"], column="A", worksheet_name=worksheet_name):
+                            log_text.appendPlainText(f"   🟢 Ячейка A{promo['row']} помечена зелёным")
+                        else:
+                            log_text.appendPlainText(f"   ⚠️ Не удалось пометить ячейку A{promo['row']}")
+                if result["errors"]:
+                    total_errors += len(result["errors"])
+                    for wh, err in result["errors"]:
+                        log_text.appendPlainText(f"❌ {promo['code']} ({wh}): {err}")
+
+            progress_bar.setValue(len(promo_list))
+            progress_label.setText("✅ Готово!")
+
+            QMessageBox.information(
+                self, "Результат",
+                f"Успешно создано: {total_success}\nОшибок: {total_errors}\n\n"
+                f"Ячейки успешно созданных промокодов помечены зелёным в Google Sheets."
+            )
+            self.status_bar.showMessage("Готово", 3000)
 
     # === ФОНОВЫЕ ИЗОБРАЖЕНИЯ ===
 
@@ -1366,36 +1930,32 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def create_refstate_tab(self):
-        """🆕 Вкладка обработки расхождений (refStateDetailed)"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
-        # Заголовок
+
         header = QLabel("<h3>📋 Проверка расхождений администраторов</h3>")
         layout.addWidget(header)
-        
+
         hint = QLabel(
             "Выберите администратора и нажмите 'Начать обработку'. "
             "Перед обработкой рекомендуется создать бэкап."
         )
         hint.setStyleSheet("color: #a6adc8;")
         layout.addWidget(hint)
-        
-        # Панель управления
+
         controls_layout = QHBoxLayout()
-        
+
         controls_layout.addWidget(QLabel("Администратор:"))
         self.refstate_admin_combo = QComboBox()
         self.refstate_admin_combo.setMinimumWidth(250)
         controls_layout.addWidget(self.refstate_admin_combo)
-        
+
         self.refstate_refresh_btn = QPushButton("🔄 Обновить список")
         self.refstate_refresh_btn.clicked.connect(self.load_refstate_admins)
         controls_layout.addWidget(self.refstate_refresh_btn)
-        
+
         controls_layout.addStretch()
-        
-        # Кнопка бэкапа
+
         self.refstate_backup_btn = QPushButton("💾 Бэкап БД")
         self.refstate_backup_btn.setStyleSheet("""
             QPushButton {
@@ -1407,8 +1967,7 @@ class MainWindow(QMainWindow):
         """)
         self.refstate_backup_btn.clicked.connect(self.create_refstate_backup)
         controls_layout.addWidget(self.refstate_backup_btn)
-        
-        # Кнопка начала обработки
+
         self.refstate_process_btn = QPushButton("▶️ Начать обработку")
         self.refstate_process_btn.setStyleSheet("""
             QPushButton {
@@ -1421,10 +1980,9 @@ class MainWindow(QMainWindow):
         """)
         self.refstate_process_btn.clicked.connect(self.start_refstate_processing)
         controls_layout.addWidget(self.refstate_process_btn)
-        
+
         layout.addLayout(controls_layout)
-        
-        # Таблица администраторов
+
         self.refstate_table = QTableWidget()
         self.refstate_table.setAlternatingRowColors(True)
         self.refstate_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1432,27 +1990,24 @@ class MainWindow(QMainWindow):
         self.refstate_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.refstate_table.verticalHeader().setVisible(False)
         layout.addWidget(self.refstate_table)
-        
-        # Статистика
+
         self.refstate_stats_label = QLabel("Всего записей: 0 | Администраторов: 0 | Сумма: 0.00₽")
         layout.addWidget(self.refstate_stats_label)
-        
+
         self.tabs.addTab(tab, "🔍 Проверка расхождений")
 
-    # === 🆕 REFSTATE: ЗАГРУЗКА И ОБРАБОТКА ===
+    # === REFSTATE: ЗАГРУЗКА И ОБРАБОТКА ===
 
     def load_refstate_admins(self):
-        """Загружает список администраторов с записями"""
         repo = RefStateRepository()
-        
+
         if not repo.connect():
             QMessageBox.critical(self, "Ошибка", "Не удалось подключиться к базе данных")
             return
-        
+
         admins = repo.get_administrators_summary()
         stats = repo.get_total_stats()
-        
-        # Заполняем combobox
+
         self.refstate_admin_combo.blockSignals(True)
         self.refstate_admin_combo.clear()
         for admin in admins:
@@ -1460,43 +2015,38 @@ class MainWindow(QMainWindow):
                 f"{admin['administrator']} ({admin['records_count']} записей)"
             )
         self.refstate_admin_combo.blockSignals(False)
-        
-        # Заполняем таблицу
+
         self.refstate_table.setRowCount(len(admins))
         self.refstate_table.setColumnCount(4)
         self.refstate_table.setHorizontalHeaderLabels(
             ["Администратор", "Записей", "Сумма", "Последняя запись"]
         )
-        
+
         for row_idx, admin in enumerate(admins):
             self.refstate_table.setItem(row_idx, 0, QTableWidgetItem(admin["administrator"]))
             self.refstate_table.setItem(row_idx, 1, QTableWidgetItem(str(admin["records_count"])))
             self.refstate_table.setItem(row_idx, 2, QTableWidgetItem(f"{admin['total_value']:.2f}₽"))
             last_created = admin["last_created"].strftime("%d.%m.%Y %H:%M") if admin["last_created"] else "—"
             self.refstate_table.setItem(row_idx, 3, QTableWidgetItem(last_created))
-        
+
         self.refstate_table.resizeColumnsToContents()
-        
-        # Обновляем статистику
+
         self.refstate_stats_label.setText(
             f"Всего записей: {stats['total_records']} | "
             f"Администраторов: {stats['total_admins']} | "
             f"Сумма: {stats['total_value']:.2f}₽"
         )
-        
+
         repo.disconnect()
 
     def start_refstate_processing(self):
-        """Начинает обработку записей выбранного администратора"""
         current_text = self.refstate_admin_combo.currentText()
         if not current_text:
             QMessageBox.warning(self, "Ошибка", "Выберите администратора из списка")
             return
-        
-        # Извлекаем имя администратора (до скобки)
+
         administrator = current_text.split(" (")[0].strip()
-        
-        # Подтверждение
+
         reply = QMessageBox.question(
             self,
             "Подтверждение обработки",
@@ -1505,27 +2055,24 @@ class MainWindow(QMainWindow):
             f"Рекомендуется создать бэкап перед обработкой.",
             QMessageBox.Yes | QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
-        
-        # Открываем диалог обработки
+
         dialog = RefStateProcessDialog(administrator, parent=self)
         dialog.exec()
-        
-        # Обновляем список после обработки
+
         self.load_refstate_admins()
 
     def create_refstate_backup(self):
-        """Создаёт бэкап таблицы refStateDetailed"""
         repo = RefStateRepository()
-        
+
         if not repo.connect():
             QMessageBox.critical(self, "Ошибка", "Не удалось подключиться к базе данных")
             return
-        
+
         result = repo.backup_table()
-        
+
         if result["success"]:
             QMessageBox.information(
                 self, "Бэкап создан",
@@ -1537,5 +2084,5 @@ class MainWindow(QMainWindow):
                 self, "Ошибка бэкапа",
                 f"❌ {result['message']}"
             )
-        
+
         repo.disconnect()

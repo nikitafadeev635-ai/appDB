@@ -1,46 +1,32 @@
-# === Python ===
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+*.pyc
+*.pyo
 venv/
 .venv/
-ENV/
-env/
 
-# === IDE ===
+# Секреты - НИКОГДА не пушить
+.env
+*.env.local
+credentials.json
+
+# IDE
 .vscode/
 .idea/
 *.swp
 
-# === OS ===
+# OS
 .DS_Store
 Thumbs.db
 
-# === Logs ===
+# Логи
 *.log
-logs/
 
-# === 🛡️ СЕКРЕТЫ (НИКОГДА НЕ КОММИТИТЬ!) ===
-.env
-*.env
-env.local
-credentials.json
-*.key
-*.pem
-secrets.py
-
-# === Database ===
+# БД
 *.db
 *.sqlite
-*.sqlite3
 
-# === Бэкапы БД ===
-backups/
-*.sql
-*.dump
-
-# === Временные/диагностические файлы ===
-code.txt
-check_*.py
+# Временные debug файлы (НЕ пушить)
+promo_v2_debug.json
+promo_debug.json
+test_*.py
